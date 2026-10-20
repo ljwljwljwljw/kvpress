@@ -12,6 +12,7 @@ from torch import nn
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.models.llama.modeling_llama import rotate_half
 
+from kvpress.presses.echo_press_kernels import HAS_TRITON, virtual_scores_triton
 from kvpress.presses.kvzip_press import KVzipPress
 from kvpress.utils import extract_keys_and_values, get_query_states
 
@@ -32,8 +33,8 @@ class EchoPress(KVzipPress):
     virtual scores of the later chunks through a quantile mapping fitted independently for each layer
     and KV head. Eviction is inherited from KVzipPress.
 
-    Only batch size 1 and a single prefill forward pass are supported. A Triton kernel for the virtual
-    scoring step is available at https://github.com/ljwljwljwljw/kvpress/tree/echo-press-triton.
+    Only batch size 1 and a single prefill forward pass are supported. This branch adds a Triton kernel
+    for the virtual scoring step (see `use_triton`); the PyTorch implementation is the reference.
 
     Based on EchoPress (https://arxiv.org/abs/2610.00412).
 
@@ -42,7 +43,12 @@ class EchoPress(KVzipPress):
     compression_ratio, layerwise, n_sink, chunk_size
         See `KVzipPress`. `chunk_size` is both the size of the virtual chunks and the number of
         context tokens reconstructed by the single replay pass.
+    use_triton : bool, default=True
+        Compute the virtual scores with the Triton kernel when available (CUDA and head_dim in
+        {64, 128, 256}), and fall back to the PyTorch implementation otherwise.
     """
+
+    use_triton: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -120,6 +126,9 @@ class EchoPress(KVzipPress):
         q_repeat = q_copy * angles.cos().to(q_copy.dtype) + rotate_half(q_copy) * angles.sin().to(q_copy.dtype)
         q_copy = q_copy.view(bsz, num_heads_kv, num_heads // num_heads_kv, q_len, head_dim)
         q_repeat = q_repeat.view(bsz, num_heads_kv, num_heads // num_heads_kv, q_len, head_dim)
+
+        if self.use_triton and HAS_TRITON and queries.is_cuda and head_dim in (64, 128, 256):
+            return virtual_scores_triton(q_copy[0], q_repeat[0], keys[0, :, start:end], keys[0, :, :sink])[None]
 
         # Keys: attention sinks, KV chunk in the cache, and repeated chunk (its keys are the cached keys
         # up to the rotation, so the repeated queries attend to them as the prefill queries do)

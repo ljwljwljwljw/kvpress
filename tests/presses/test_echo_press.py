@@ -3,9 +3,10 @@
 
 import pytest
 import torch
-from transformers import DynamicCache
+from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
 
 from kvpress import EchoPress
+from kvpress.presses.echo_press_kernels import HAS_TRITON
 from tests.fixtures import unit_test_model  # noqa: F401
 
 
@@ -71,3 +72,53 @@ def test_single_replay_pass_and_calibration(unit_test_model, monkeypatch, chunk_
     if later_chunks.shape[-1] > 0:
         assert (later_chunks >= first_chunk.amin(-1, keepdim=True)).all()
         assert (later_chunks <= first_chunk.amax(-1, keepdim=True)).all()
+
+
+needs_triton = pytest.mark.skipif(not (torch.cuda.is_available() and HAS_TRITON), reason="requires CUDA and triton")
+
+
+@needs_triton
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_triton_virtual_scores_match_torch(dtype):
+    torch.manual_seed(0)
+    press = EchoPress()
+    press.context_length = 300
+    queries = torch.randn(1, 4, 300, 64, device="cuda", dtype=dtype)
+    keys = torch.randn(1, 2, 300, 64, device="cuda", dtype=dtype)
+    inv_freq = 1.0 / 10000 ** (torch.arange(0, 64, 2, device="cuda").float() / 64)
+    for start, end in [(0, 64), (64, 128), (256, 300)]:
+        press.use_triton = False
+        reference = press._virtual_scores(queries, keys, start, end, 12, inv_freq)
+        press.use_triton = True
+        scores = press._virtual_scores(queries, keys, start, end, 12, inv_freq)
+        torch.testing.assert_close(scores, reference, atol=2e-2, rtol=2e-2)
+
+
+@needs_triton
+def test_triton_press_matches_torch_end_to_end(monkeypatch):
+    config = LlamaConfig(
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=32000,
+        max_position_embeddings=4096,
+        initializer_range=0.1,  # large enough weights for peaked, non-trivial attention
+    )
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(config).to("cuda", torch.bfloat16).eval()
+    model.config.name_or_path = "MaxJeblick/llama2-0b-unit-test"  # tokenizer used by KVzipPress
+    ids = torch.randint(3, config.vocab_size, (1, 300), device="cuda")
+
+    scores = {}
+    for use_triton in (False, True):
+        press = EchoPress(compression_ratio=0.5, chunk_size=64, use_triton=use_triton)
+        monkeypatch.setattr(
+            press, "compress_post", lambda m, p=press, k=use_triton: scores.__setitem__(k, p.score_val.clone())
+        )
+        with torch.no_grad(), press(model):
+            model(input_ids=ids, past_key_values=DynamicCache(), logits_to_keep=1)
+    assert scores[False].float().std() > 0.05  # the attention is not uniform, so the comparison is meaningful
+    # The quantile calibration of the later chunks amplifies the bf16 rounding of the scores
+    torch.testing.assert_close(scores[True], scores[False], atol=5e-2, rtol=5e-2)
